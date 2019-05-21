@@ -24,6 +24,7 @@
             [metabase.query-processor
              [store :as qp.store]
              [util :as qputil]]
+            [metabase.util.i18n :refer [tru]]
             [metabase.util
              [date :as du]
              [honeysql-extensions :as hx]
@@ -119,20 +120,42 @@
         (do (Thread/sleep 100) ; Might not be the best way, but the pattern is that we poll Presto at intervals
             (fetch-presto-results! details results nextUri))))))
 
+(defn- maybe-cancel-query!
+  {:arglists '([details details-with-tunnel query-response])}
+  [{:keys [host port]} details-with-tunnel {query-id :id, info-uri :infoUri}]
+  (println "query-id:" query-id) ; NOCOMMIT
+  (if-not query-id
+    (log/warn (trs "Client connection closed, no query-id found, can't cancel query"))
+    (try
+      (let [tunneled-uri (details->uri details-with-tunnel (str "/v1/query/" query-id))
+            cancel-url   (create-cancel-url tunneled-uri host port info-uri)]
+        (http/delete cancel-url (details->request details-with-tunnel)))
+      ;; If we fail to cancel the query, log it but propogate the interrupted exception, instead of
+      ;; covering it up with a failed cancel
+      (catch Exception e
+        (println "e in maybe-cancel" e) ; NOCOMMIT
+        (log/error e (trs "Error canceling query with ID {0}" query-id))))))
+
+(defn- presto-results
+  {:arglists '([details query-response])}
+  [{:keys [report-timezone]} {:keys [columns row data]}]
+  (let [rows (parse-presto-results report-timezone (or columns []) (or data []))]
+    {:columns (or columns [])
+     :rows    rows}))
+
 (defn- execute-presto-query!
   {:style/indent 1}
   [details query]
-  {:pre [(map? details)]}
   (ssh/with-ssh-tunnel [details-with-tunnel details]
-    (let [{{:keys [columns data nextUri error id infoUri]} :body}
-          (http/post (details->uri details-with-tunnel "/v1/statement")
-                     (assoc (details->request details-with-tunnel)
-                             :body query, :as :json, :redirect-strategy :lax))]
+    (let [{{:keys [nextUri error], :as query-response} :body} (http/post
+                                                               (details->uri details-with-tunnel "/v1/statement")
+                                                               (assoc (details->request details-with-tunnel)
+                                                                 :body query, :as :json, :redirect-strategy :lax))]
       (when error
-        (throw (ex-info (or (:message error) "Error preparing query.") error)))
-      (let [rows    (parse-presto-results (:report-timezone details) (or columns []) (or data []))
-            results {:columns (or columns [])
-                     :rows    rows}]
+        (throw (ex-info (str (or (:message error) (tru "Error preparing query.")))
+                 error)))
+      (println "here") ; NOCOMMIT
+      (let [results (presto-results details query-response)]
         (if (nil? nextUri)
           results
           ;; When executing the query, it doesn't return the results, but is geared toward async queries. After
@@ -142,17 +165,7 @@
             (try
               @results-future
               (catch InterruptedException e
-                (if id
-                  ;; If we have a query id, we can cancel the query
-                  (try
-                    (let [tunneledUri (details->uri details-with-tunnel (str "/v1/query/" id))
-                          adjustedUri (create-cancel-url tunneledUri (get details :host) (get details :port) infoUri)]
-                      (http/delete adjustedUri(details->request details-with-tunnel)))
-                    ;; If we fail to cancel the query, log it but propogate the interrupted exception, instead of
-                    ;; covering it up with a failed cancel
-                    (catch Exception e
-                      (log/error e (trs "Error canceling query with ID {0}" id))))
-                  (log/warn (trs "Client connection closed, no query-id found, can't cancel query")))
+                (maybe-cancel-query! details details-with-tunnel query-response)
                 ;; Propagate the error so that any finalizers can still run
                 (throw e)))))))))
 
