@@ -24,7 +24,6 @@
             [metabase.query-processor
              [store :as qp.store]
              [util :as qputil]]
-            [metabase.util.i18n :refer [tru]]
             [metabase.util
              [date :as du]
              [honeysql-extensions :as hx]
@@ -59,11 +58,6 @@
                             {"X-Presto-Time-Zone" report-timezone}))}
          (when password
            {:basic-auth [user password]})))
-
-(defn ^:private create-cancel-url [cancel-uri host port info-uri]
-  ;; Replace the host in the cancel-uri with the host from the info-uri provided from the presto response- this doesn't
-  ;; break SSH tunneling as the host in the cancel-uri is different if it's enabled
-  (str/replace cancel-uri (str host ":" port) (get (str/split info-uri #"/") 2)))
 
 (defn- parse-time-with-tz [s]
   ;; Try parsing with offset first then with full ZoneId
@@ -120,54 +114,63 @@
         (do (Thread/sleep 100) ; Might not be the best way, but the pattern is that we poll Presto at intervals
             (fetch-presto-results! details results nextUri))))))
 
-(defn- maybe-cancel-query!
-  {:arglists '([details details-with-tunnel query-response])}
-  [{:keys [host port]} details-with-tunnel {query-id :id, info-uri :infoUri}]
-  (println "query-id:" query-id) ; NOCOMMIT
+(defn- cancel-uri [^String query-uri, ^String info-uri]
+  ;; Replace the host in the `query-uri` with the host from the `info-uri` provided from the presto response- this
+  ;; doesn't break SSH tunneling as the host in the `cancel-uri` is different if it's enabled
+  (let [query-uri (URI. query-uri)
+        info-uri  (URI. info-uri)]
+    (.toString (URI. (.getScheme info-uri) (.getHost info-uri) (.getPath query-uri) (.getFragment query-uri)))))
+
+(defn- cancel-query! [details-with-tunnel query-id info-uri]
   (if-not query-id
     (log/warn (trs "Client connection closed, no query-id found, can't cancel query"))
+    ;; If we have a query id, we can cancel the query
     (try
-      (let [tunneled-uri (details->uri details-with-tunnel (str "/v1/query/" query-id))
-            cancel-url   (create-cancel-url tunneled-uri host port info-uri)]
-        (http/delete cancel-url (details->request details-with-tunnel)))
+      (let [query-uri    (details->uri details-with-tunnel (str "/v1/query/" query-id))
+            adjusted-uri (cancel-uri query-uri info-uri)]
+        (http/delete adjusted-uri (details->request details-with-tunnel)))
       ;; If we fail to cancel the query, log it but propogate the interrupted exception, instead of
       ;; covering it up with a failed cancel
       (catch Exception e
-        (println "e in maybe-cancel" e) ; NOCOMMIT
         (log/error e (trs "Error canceling query with ID {0}" query-id))))))
 
-(defn- presto-results
-  {:arglists '([details query-response])}
-  [{:keys [report-timezone]} {:keys [columns row data]}]
-  (let [rows (parse-presto-results report-timezone (or columns []) (or data []))]
-    {:columns (or columns [])
-     :rows    rows}))
+(defn- execute-query! [details-with-tunnel query]
+  (let [{{:keys [error], :as response} :body} (http/post (details->uri details-with-tunnel "/v1/statement")
+                                                         (assoc (details->request details-with-tunnel)
+                                                           :body query, :as :json, :redirect-strategy :lax))]
+    (when error
+      (throw (ex-info (str (or (:message error) (tru "Error preparing query.")))
+               error)))
+    response))
 
 (defn- execute-presto-query!
   {:style/indent 1}
-  [details query]
+  [{:keys [report-timezone], :as details} query]
+  {:pre [(map? details)]}
   (ssh/with-ssh-tunnel [details-with-tunnel details]
-    (let [{{:keys [nextUri error], :as query-response} :body} (http/post
-                                                               (details->uri details-with-tunnel "/v1/statement")
-                                                               (assoc (details->request details-with-tunnel)
-                                                                 :body query, :as :json, :redirect-strategy :lax))]
-      (when error
-        (throw (ex-info (str (or (:message error) (tru "Error preparing query.")))
-                 error)))
-      (println "here") ; NOCOMMIT
-      (let [results (presto-results details query-response)]
-        (if (nil? nextUri)
-          results
-          ;; When executing the query, it doesn't return the results, but is geared toward async queries. After
-          ;; issuing the query, the below will ask for the results. Asking in a future so that this thread can be
-          ;; interrupted if the client disconnects
-          (let [results-future (future (fetch-presto-results! details-with-tunnel results nextUri))]
-            (try
-              @results-future
-              (catch InterruptedException e
-                (maybe-cancel-query! details details-with-tunnel query-response)
-                ;; Propagate the error so that any finalizers can still run
-                (throw e)))))))))
+    (let [{:keys [columns data nextUri id infoUri]} (execute-query! details-with-tunnel query)
+          rows                                      (parse-presto-results report-timezone (or columns []) (or data []))
+          results                                   {:columns (or columns [])
+                                                     :rows    rows}]
+      (if (nil? nextUri)
+        results
+        ;; When executing the query, it doesn't return the results, but is geared toward async queries. After
+        ;; issuing the query, the below will ask for the results. Asking in a future so that this thread can be
+        ;; interrupted if the client disconnects
+        (let [results-future (future
+                               (try
+                                 (fetch-presto-results! details-with-tunnel results nextUri)
+                                 (catch Throwable e
+                                   e)))]
+          (try
+            (let [result @results-future]
+              (if (instance? Throwable result)
+                (throw result)
+                result))
+            (catch InterruptedException e
+              (cancel-query! details-with-tunnel id infoUri)
+              ;; Propagate the error so that any finalizers can still run
+              (throw e))))))))
 
 
 ;;; `:sql` driver implementation
