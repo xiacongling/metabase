@@ -89,7 +89,7 @@ export function getClickHoverObject(
       data = rawCols.map((col, i) => {
         if (isNormalized && cols[1].field_ref === col.field_ref) {
           return {
-            key: getColumnDisplayName(cols),
+            key: getColumnDisplayName(cols[1]),
             value: formatValue(d.data.value, {
               number_style: "percent",
               column: cols[1],
