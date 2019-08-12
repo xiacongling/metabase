@@ -1,6 +1,5 @@
 /// code to "apply" chart tooltips. (How does one apply a tooltip?)
 
-import _ from "underscore";
 import d3 from "d3";
 import moment from "moment";
 
