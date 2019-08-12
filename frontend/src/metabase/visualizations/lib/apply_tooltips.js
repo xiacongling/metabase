@@ -147,8 +147,6 @@ export function getClickHoverObject(
   const column = series[seriesIndex].data.cols[1];
   value = parseBooleanStringValue({ column, value });
 
-  data = _.uniq(data, d => d.key);
-
   // We align tooltips differently depending on the type of chart and whether
   // the user is hovering/clicked.
   //
