@@ -11,18 +11,14 @@ import { getFriendlyName } from "./utils";
 
 export function getClickHoverObject(
   d,
-  { series, isNormalized, isStacked, isScalarSeries, chart },
+  { series, isNormalized, seriesIndex, seriesTitle, classList, event, element },
 ) {
   let { cols } = series[0].data;
-  const seriesIndex = determineSeriesIndexFromElement(this, isStacked);
-  const seriesSettings = chart.settings.series(series[seriesIndex]);
-  const seriesTitle = seriesSettings && seriesSettings.title;
-
-  const card = series[seriesIndex].card;
+  const { card } = series[seriesIndex];
 
   const isMultiseries = series.length > 1;
   const isBreakoutMultiseries = isMultiseries && card._breakoutColumn;
-  const isBar = this.classList.contains("bar");
+  const isBar = classList.includes("bar");
   const isSingleSeriesBar = isBar && !isMultiseries;
 
   // always format the second column as the series name?
@@ -74,12 +70,23 @@ export function getClickHoverObject(
 
     const seriesData = series[seriesIndex].data || {};
     const rawCols = seriesData._rawCols || cols;
-    const row = seriesData.rows.find(
-      ([x]) =>
-        String(x) === String(d.x) ||
-        (moment.isMoment(d.x) &&
-          formatValue(d.x, { column: rawCols[0] }) === String(x)),
+    const { key } = d.data;
+
+    // We look through the rows to match up they key in d.data to the x value
+    // from some row.
+    const row = seriesData.rows.find(([x]) =>
+      moment.isMoment(key)
+        ? // for dates, we check two things:
+          // 1. does parsing x produce an equivalent moment value?
+          key.isSame(moment(x)) ||
+          // 2. if not, we format the key using the column info
+          // this catches values like years that don't parse correctly above
+          formatValue(key, { column: rawCols[0] }) === String(x)
+        : // otherwise, we just check if the string value matches
+          // e.g. String("123") === String(123)
+          String(x) === String(key),
     );
+
     // try to get row from _origin but fall back to the row we already have
     const { _origin: { row: rawRow = row } = {} } = row;
 
@@ -108,13 +115,7 @@ export function getClickHoverObject(
   } else if (isBreakoutMultiseries) {
     // an area doesn't have any data, but might have a breakout series to show
     const { _breakoutValue: value, _breakoutColumn: column } = card;
-    data = [
-      {
-        key: getColumnDisplayName(card._breakoutColumn),
-        col: column,
-        value,
-      },
-    ];
+    data = [{ key: getColumnDisplayName(column), col: column, value }];
     dimensions = [{ column, value }];
   }
 
@@ -157,16 +158,16 @@ export function getClickHoverObject(
   // right next to where the user just clicked. The exception is line charts.
   // There we want to snap to the closest hovered dot since the voronoi snapping
   // we do means the mouse might be slightly off.
-  const isLine = this.classList.contains("dot");
-  const isArea = this.classList.contains("area");
+  const isLine = classList.includes("dot");
+  const isArea = classList.includes("area");
   const shouldUseMouseCoordinates =
-    d3.event.type === "mousemove" ? isArea : !isLine;
+    event.type === "mousemove" ? isArea : !isLine;
 
   return {
     // for single series bar charts, fade the series and highlght the hovered element with CSS
     index: isSingleSeriesBar ? -1 : seriesIndex,
-    element: !shouldUseMouseCoordinates ? this : null,
-    event: shouldUseMouseCoordinates ? d3.event : null,
+    element: !shouldUseMouseCoordinates ? element : null,
+    event: shouldUseMouseCoordinates ? event : null,
     data: data.length > 0 ? data : null,
     dimensions,
     value,
@@ -185,33 +186,52 @@ function parseBooleanStringValue({ column, value }) {
   return value;
 }
 
-// series = an array of serieses (?) in the chart. There's only one thing in here unless we're dealing with a multiseries chart
-function applyChartTooltips(
+export function setupTooltips(
+  { settings, series, isScalarSeries, onHoverChange, onVisualizationClick },
+  datas,
   chart,
-  series,
-  isStacked,
-  isNormalized,
-  isScalarSeries,
-  onHoverChange,
-  onVisualizationClick,
+  { isBrushing },
 ) {
+  const stacked = isStacked(settings, datas);
+  const normalized = isNormalized(settings, datas);
+
+  const getClickHoverHelper = (target, d) => {
+    const seriesIndex = determineSeriesIndexFromElement(target, stacked);
+    const seriesSettings = chart.settings.series(series[seriesIndex]);
+    const seriesTitle = seriesSettings && seriesSettings.title;
+    const classList = [...target.classList.values()]; // values returns an iterator, but getClickHoverObject uses Array#includes
+
+    // no tooltips when brushing
+    if (isBrushing()) {
+      return null;
+    }
+    // no tooltips over lines
+    if (classList.includes("line")) {
+      return null;
+    }
+
+    return getClickHoverObject(d, {
+      classList,
+      seriesTitle,
+      seriesIndex,
+      series,
+      isNormalized: normalized,
+      isScalarSeries,
+      isStacked: stacked,
+      event: d3.event,
+      element: target,
+    });
+  };
+
   chart.on("renderlet.tooltips", function(chart) {
     // remove built-in tooltips
     chart.selectAll("title").remove();
-
-    const getObjectArgs = {
-      chart,
-      series,
-      isNormalized,
-      isScalarSeries,
-      isStacked,
-    };
 
     if (onHoverChange) {
       chart
         .selectAll(".bar, .dot, .area, .line, .bubble")
         .on("mousemove", function(d) {
-          const hovered = getClickHoverObject.call(this, d, getObjectArgs);
+          const hovered = getClickHoverHelper(this, d);
           onHoverChange(hovered);
         })
         .on("mouseleave", function() {
@@ -224,8 +244,7 @@ function applyChartTooltips(
 
     if (onVisualizationClick) {
       const onClick = function(d) {
-        const clicked = getClickHoverObject.call(this, d, getObjectArgs);
-
+        const clicked = getClickHoverHelper(this, d);
         if (clicked) {
           onVisualizationClick(clicked);
         }
@@ -242,34 +261,4 @@ function applyChartTooltips(
         .on("mousedown", onClick);
     }
   });
-}
-
-export function setupTooltips(
-  { settings, series, isScalarSeries, onHoverChange, onVisualizationClick },
-  datas,
-  parent,
-  { isBrushing },
-) {
-  applyChartTooltips(
-    parent,
-    series,
-    isStacked(settings, datas),
-    isNormalized(settings, datas),
-    isScalarSeries,
-    hovered => {
-      // disable tooltips while brushing
-      if (onHoverChange && !isBrushing()) {
-        // disable tooltips on lines
-        if (
-          hovered &&
-          hovered.element &&
-          hovered.element.classList.contains("line")
-        ) {
-          delete hovered.element;
-        }
-        onHoverChange(hovered);
-      }
-    },
-    onVisualizationClick,
-  );
 }
