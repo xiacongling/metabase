@@ -39,7 +39,7 @@ export default function rowRenderer(
   );
 
   const dataset = crossfilter(rows);
-  const dimension = dataset.dimension(d => d[0]);
+  const dimension = dataset.dimension(d => (d[0] === null ? "null" : d[0]));
   const group = dimension.group().reduceSum(d => d[1]);
   const xDomain = d3.extent(rows, d => d[1]);
   const yValues = rows.map(d => d[0]);
