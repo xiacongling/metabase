@@ -9,7 +9,7 @@ import {
   StringColumn,
 } from "../__support__/visualizations";
 
-import rowRenderer from "metabase/visualizations/lib/rowRenderer";
+import rowRenderer from "metabase/visualizations/lib/RowRenderer";
 
 describe("RowChart", () => {
   let element;
