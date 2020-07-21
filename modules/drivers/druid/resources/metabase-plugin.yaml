@@ -14,6 +14,10 @@ driver:
         - port
         - display-name: Broker node port
           default: 8082
+    - merge:
+        - user
+        - required: false
+    - password
   connection-properties-include-tunnel-config: true
 init:
   - step: load-namespace

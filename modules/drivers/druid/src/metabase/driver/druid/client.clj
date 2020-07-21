@@ -7,7 +7,8 @@
             [metabase.util :as u]
             [metabase.util
              [i18n :refer [trs tru]]
-             [ssh :as ssh]]))
+             [ssh :as ssh]]
+            [clojure.string :as string]))
 
 (defn details->url
   "Helper for building a Druid URL.
@@ -16,6 +17,11 @@
   [{:keys [host port]} & strs]
   {:pre [(string? host) (seq host) (integer? port)]}
   (apply str (format "%s:%d" host port) (map name strs)))
+
+(defn details->auth
+  "Helper for extracting Druid user and password for Basic Authentication."
+  [{:keys [user password]}]
+  (if (not-any? string/blank? [user password]) [user password] nil))
 
 (defn- do-request
   "Perform a JSON request using `request-fn` against `url`.
@@ -47,7 +53,7 @@
   {:pre [(map? details) (map? query)]}
   (ssh/with-ssh-tunnel [details-with-tunnel details]
     (try
-      (POST (details->url details-with-tunnel "/druid/v2"), :body query)
+      (POST (details->url details-with-tunnel "/druid/v2"), :body query :basic-auth (details->auth details-with-tunnel))
       ;; don't need to do anything fancy if the query was killed
       (catch InterruptedException e
         (throw e))
